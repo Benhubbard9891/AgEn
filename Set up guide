@@ -1,0 +1,186 @@
+# Coding Agent Workflow - Setup Guide
+
+## Project Structure
+
+```
+coding-agent/
+├── package.json
+├── .env
+├── system-prompts.js      # Role definitions + schemas (Artifact 1)
+├── orchestrator.js        # Main workflow engine (Artifact 2)
+├── logs/
+│   └── supervisor-audit.jsonl   # Auto-created
+└── workspace/             # Where generated code lands
+```
+
+---
+
+## Step 1: Initialize Project
+
+```bash
+mkdir coding-agent && cd coding-agent
+npm init -y
+```
+
+Edit `package.json`:
+```json
+{
+  "name": "coding-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node orchestrator.js",
+    "audit": "node orchestrator.js audit"
+  }
+}
+```
+
+---
+
+## Step 2: Create Files
+
+### `.env`
+```env
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+LLM_MODEL=claude-sonnet-4-20250514
+LLM_ENDPOINT=https://api.anthropic.com/v1/messages
+```
+
+### `system-prompts.js`
+Copy the entire contents from **Artifact 1** (Coding Agent System Prompts)
+
+### `orchestrator.js`
+Copy the entire contents from **Artifact 2** (Coding Agent Orchestrator)
+
+---
+
+## Step 3: Install Dependencies
+
+```bash
+# Optional but recommended for production
+npm install dotenv ajv
+```
+
+Add to top of `orchestrator.js` if using dotenv:
+```javascript
+import 'dotenv/config';
+```
+
+---
+
+## Step 4: Test Run
+
+```bash
+# Simple test
+node orchestrator.js "Create a function that validates email addresses"
+
+# From requirements file
+echo "Build a CLI tool that converts CSV to JSON" > requirements.txt
+node orchestrator.js --from-file requirements.txt
+
+# Check audit trail
+node orchestrator.js audit <session-id-from-output>
+```
+
+---
+
+## Step 5: Customize Thresholds
+
+Edit `CONFIG` in `orchestrator.js`:
+
+```javascript
+const CONFIG = {
+  maxRetries: 3,                    // Attempts before human escalation
+  backoffMs: [1000, 3000, 8000],    // Retry delays
+  thresholds: {
+    security: { 
+      maxSeverity: 0.3,             // 0-1 scale, lower = stricter
+      maxCritical: 0,               // Zero tolerance for critical
+      maxHigh: 1                    // Allow 1 high severity
+    },
+    coverage: { 
+      statements: 0.80,             // 80% statement coverage
+      branches: 0.70,               // 70% branch coverage
+      functions: 0.90               // 90% function coverage
+    },
+    quality: { 
+      minScore: 0.7,                // Style quality floor
+      maxComplexity: 15             // Cyclomatic complexity cap
+    }
+  }
+};
+```
+
+---
+
+## Next Steps (Priority Order)
+
+### 1. Add Real Schema Validation
+Replace the simplified `validateSchema()` with Ajv:
+
+```bash
+npm install ajv
+```
+
+```javascript
+import Ajv from 'ajv';
+const ajv = new Ajv({ strict: true, allErrors: true });
+
+validateSchema(data, schema) {
+  const validate = ajv.compile(schema);
+  const valid = validate(data);
+  return { 
+    valid, 
+    errors: validate.errors?.map(e => e.message) || [] 
+  };
+}
+```
+
+### 2. Add File System Operations
+For the Coder to actually write files:
+
+```javascript
+async writeImplementation(files, baseDir = './workspace') {
+  for (const file of files) {
+    const fullPath = path.join(baseDir, file.path);
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, file.content);
+    console.log(`   └─ Wrote ${file.path}`);
+  }
+}
+```
+
+### 3. Add Test Execution
+Actually run the generated tests:
+
+```javascript
+async runTests(testFiles, commands) {
+  // Write test files first
+  await this.writeImplementation(testFiles, './workspace');
+  
+  // Execute test command
+  const { execSync } = await import('child_process');
+  try {
+    execSync(commands.run_all, { cwd: './workspace', stdio: 'inherit' });
+    return { passed: true };
+  } catch (e) {
+    return { passed: false, output: e.stdout?.toString() };
+  }
+}
+```
+
+### 4. Build the Dashboard (Optional)
+For the real-time DAG visualization, you'd create a React component that:
+- Connects via WebSocket to the orchestrator
+- Receives gate status updates
+- Renders the SVG with animated state changes
+
+---
+
+## Quick Verification Checklist
+
+- [ ] `node --version` returns 18+ (for native fetch)
+- [ ] `.env` has valid `ANTHROPIC_API_KEY`
+- [ ] Both JS files have `export` statements intact
+- [ ] `logs/` directory is writable
+- [ ] Test with simple requirement before complex ones
