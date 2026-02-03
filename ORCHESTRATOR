@@ -1,0 +1,533 @@
+// ============================================================================
+// CODING AGENT ORCHESTRATOR
+// Zero-trust DAG execution with self-healing retry loops
+// ============================================================================
+
+import crypto from 'crypto';
+import fs from 'fs/promises';
+import { SYSTEM_PROMPTS, SCHEMAS } from './system-prompts.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CONFIG = {
+  maxRetries: 3,
+  backoffMs: [1000, 3000, 8000],  // Exponential backoff
+  thresholds: {
+    security: { maxSeverity: 0.3, maxCritical: 0, maxHigh: 1 },
+    coverage: { statements: 0.80, branches: 0.70, functions: 0.90 },
+    quality: { minScore: 0.7, maxComplexity: 15 }
+  },
+  auditLogPath: './logs/supervisor-audit.jsonl',
+  model: process.env.LLM_MODEL || 'claude-sonnet-4-20250514',
+  apiEndpoint: process.env.LLM_ENDPOINT || 'https://api.anthropic.com/v1/messages'
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE EXECUTION ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CodingAgentOrchestrator {
+  constructor(apiKey) {
+    this.apiKey = apiKey;
+    this.sessionId = crypto.randomUUID();
+    this.auditTrail = [];
+  }
+
+  /**
+   * Execute a single role with strict schema validation
+   */
+  async executeRole(role, input, schema = null) {
+    const startTime = Date.now();
+    const inputHash = this.hash(JSON.stringify(input));
+    
+    const systemPrompt = SYSTEM_PROMPTS[role];
+    if (!systemPrompt) throw new Error(`Unknown role: ${role}`);
+
+    const response = await this.callLLM(systemPrompt, JSON.stringify(input, null, 2));
+    
+    // Parse and validate JSON response
+    let parsed;
+    try {
+      // Strip markdown code fences if present
+      const cleaned = response.replace(/```json\n?|\n?```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      throw new Error(`${role} returned invalid JSON: ${e.message}`);
+    }
+
+    // Schema validation (zero-trust)
+    if (schema) {
+      const validation = this.validateSchema(parsed, schema);
+      if (!validation.valid) {
+        throw new Error(`${role} schema violation: ${validation.errors.join(', ')}`);
+      }
+    }
+
+    // Audit log entry
+    const auditEntry = {
+      sessionId: this.sessionId,
+      role,
+      timestamp: new Date().toISOString(),
+      inputHash,
+      outputHash: this.hash(JSON.stringify(parsed)),
+      passed: parsed.passed_logic_gate,
+      durationMs: Date.now() - startTime
+    };
+    this.auditTrail.push(auditEntry);
+    await this.appendAuditLog(auditEntry);
+
+    return { data: parsed, audit: auditEntry };
+  }
+
+  /**
+   * Execute role with retry loop and feedback collection
+   */
+  async executeWithRetry(role, input, schema = null) {
+    let lastError = null;
+    let feedback = [];
+
+    for (let attempt = 0; attempt < CONFIG.maxRetries; attempt++) {
+      try {
+        // Inject previous feedback into input
+        const enrichedInput = attempt > 0 
+          ? { ...input, _retry_feedback: feedback }
+          : input;
+
+        const result = await this.executeRole(role, enrichedInput, schema);
+        
+        if (result.data.passed_logic_gate) {
+          return result;
+        }
+
+        // Gate failed - collect feedback for next attempt
+        feedback.push(this.extractFeedback(role, result.data));
+        
+        // Backoff before retry
+        if (attempt < CONFIG.maxRetries - 1) {
+          await this.sleep(CONFIG.backoffMs[attempt]);
+        }
+      } catch (error) {
+        lastError = error;
+        feedback.push({ error: error.message, attempt });
+        
+        if (attempt < CONFIG.maxRetries - 1) {
+          await this.sleep(CONFIG.backoffMs[attempt]);
+        }
+      }
+    }
+
+    // Max retries exceeded - escalate to human
+    return {
+      data: null,
+      escalated: true,
+      feedback,
+      lastError: lastError?.message
+    };
+  }
+
+  /**
+   * Main workflow: Architect → Coder → [Security | Tester | Style] → Supervisor
+   */
+  async runWorkflow(userRequirement) {
+    console.log(`\n🚀 Session: ${this.sessionId}`);
+    console.log(`📋 Requirement: ${userRequirement.slice(0, 100)}...`);
+
+    // ─── PHASE 1: Architecture ───
+    console.log('\n🏗️  [1/5] Architecting solution...');
+    const archResult = await this.executeWithRetry(
+      'ARCHITECT',
+      { requirement: userRequirement },
+      SCHEMAS.ARCHITECT_OUTPUT
+    );
+    
+    if (archResult.escalated || !archResult.data?.passed_logic_gate) {
+      return this.buildFailureResponse('ARCHITECT', archResult);
+    }
+
+    // ─── PHASE 2: Implementation ───
+    console.log('💻 [2/5] Generating implementation...');
+    const codeResult = await this.executeWithRetry('CODER', {
+      specification: archResult.data.specification,
+      original_requirement: userRequirement
+    });
+
+    if (codeResult.escalated || !codeResult.data?.passed_logic_gate) {
+      return this.buildFailureResponse('CODER', codeResult);
+    }
+
+    // Verify checksums
+    this.verifyChecksums(codeResult.data.files);
+
+    // ─── PHASE 3: Parallel Validation Gates ───
+    console.log('🔍 [3/5] Running parallel validation gates...');
+    const [securityResult, testResult, styleResult] = await Promise.all([
+      this.executeWithRetry('SECURITY_CRITIC', {
+        files: codeResult.data.files,
+        specification: archResult.data.specification
+      }, SCHEMAS.SECURITY_CRITIC_OUTPUT),
+      
+      this.executeWithRetry('UNIT_TESTER', {
+        files: codeResult.data.files,
+        specification: archResult.data.specification
+      }),
+      
+      this.executeWithRetry('STYLE_REVIEWER', {
+        files: codeResult.data.files
+      })
+    ]);
+
+    // ─── PHASE 4: Gate Evaluation ───
+    console.log('⚖️  [4/5] Evaluating gate results...');
+    const gateResults = {
+      security: this.evaluateSecurityGate(securityResult),
+      testing: this.evaluateTestGate(testResult),
+      style: this.evaluateStyleGate(styleResult)
+    };
+
+    const allGatesPassed = Object.values(gateResults).every(g => g.passed);
+
+    // ─── PHASE 5: Self-Healing or Supervisor ───
+    if (!allGatesPassed) {
+      console.log('🔧 [4b/5] Gates failed - attempting self-healing...');
+      
+      const healingResult = await this.attemptSelfHealing(
+        codeResult.data,
+        gateResults,
+        archResult.data.specification
+      );
+
+      if (!healingResult.success) {
+        // Re-run parallel gates on healed code
+        return this.buildFailureResponse('VALIDATION_GATES', {
+          gateResults,
+          healingAttempted: true,
+          healingResult
+        });
+      }
+
+      // Update code result with healed version
+      codeResult.data = healingResult.healedCode;
+    }
+
+    // ─── PHASE 6: Final Supervisor Review ───
+    console.log('👔 [5/5] Supervisor final review...');
+    const supervisorResult = await this.executeRole('SUPERVISOR', {
+      original_requirement: userRequirement,
+      architect_spec: archResult.data,
+      coder_implementation: codeResult.data,
+      security_report: securityResult.data,
+      test_report: testResult.data,
+      style_report: styleResult.data
+    });
+
+    // ─── BUILD FINAL RESPONSE ───
+    const finalResponse = {
+      sessionId: this.sessionId,
+      verdict: supervisorResult.data.final_verdict,
+      confidence: supervisorResult.data.confidence,
+      implementation: codeResult.data,
+      tests: testResult.data?.test_files || [],
+      qualityMetrics: supervisorResult.data.quality_metrics,
+      auditTrail: this.auditTrail,
+      revisionInstructions: supervisorResult.data.revision_instructions
+    };
+
+    this.logFinalResult(finalResponse);
+    return finalResponse;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // SELF-HEALING ENGINE
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  async attemptSelfHealing(code, gateResults, specification) {
+    const issues = this.collectIssuesForHealing(gateResults);
+    
+    if (issues.length === 0) {
+      return { success: false, reason: 'No actionable issues found' };
+    }
+
+    console.log(`   └─ Found ${issues.length} issues to fix`);
+
+    // Route back to Coder with specific fix instructions
+    const healingResult = await this.executeWithRetry('CODER', {
+      specification,
+      existing_code: code,
+      fix_instructions: issues,
+      mode: 'HEALING'
+    });
+
+    if (healingResult.escalated || !healingResult.data?.passed_logic_gate) {
+      return { success: false, reason: 'Healing attempt failed', details: healingResult };
+    }
+
+    return { success: true, healedCode: healingResult.data };
+  }
+
+  collectIssuesForHealing(gateResults) {
+    const issues = [];
+
+    // Security issues
+    if (!gateResults.security.passed && gateResults.security.vulnerabilities) {
+      for (const vuln of gateResults.security.vulnerabilities) {
+        if (['critical', 'high'].includes(vuln.severity)) {
+          issues.push({
+            source: 'SECURITY_CRITIC',
+            file: vuln.file,
+            line: vuln.line_start,
+            issue: vuln.description,
+            fix: vuln.remediation,
+            fixed_code: vuln.fixed_code
+          });
+        }
+      }
+    }
+
+    // Style issues (errors only, not warnings)
+    if (!gateResults.style.passed && gateResults.style.issues) {
+      for (const issue of gateResults.style.issues) {
+        if (issue.severity === 'error') {
+          issues.push({
+            source: 'STYLE_REVIEWER',
+            file: issue.file,
+            line: issue.line,
+            issue: issue.description,
+            fix: issue.suggested_fix
+          });
+        }
+      }
+    }
+
+    // Test failures
+    if (!gateResults.testing.passed && gateResults.testing.untestable_areas) {
+      for (const area of gateResults.testing.untestable_areas) {
+        issues.push({
+          source: 'UNIT_TESTER',
+          file: area.file,
+          issue: `Untestable code: ${area.reason}`,
+          fix: area.suggestion
+        });
+      }
+    }
+
+    return issues;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // GATE EVALUATORS
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  evaluateSecurityGate(result) {
+    if (result.escalated || !result.data) {
+      return { passed: false, reason: 'Gate execution failed' };
+    }
+
+    const { severity, vulnerabilities } = result.data;
+    const t = CONFIG.thresholds.security;
+
+    const criticalCount = vulnerabilities.filter(v => v.severity === 'critical').length;
+    const highCount = vulnerabilities.filter(v => v.severity === 'high').length;
+
+    const passed = severity < t.maxSeverity && 
+                   criticalCount <= t.maxCritical && 
+                   highCount <= t.maxHigh;
+
+    return {
+      passed,
+      severity,
+      criticalCount,
+      highCount,
+      vulnerabilities: passed ? [] : vulnerabilities
+    };
+  }
+
+  evaluateTestGate(result) {
+    if (result.escalated || !result.data) {
+      return { passed: false, reason: 'Gate execution failed' };
+    }
+
+    const { coverage_estimate, untestable_areas } = result.data;
+    const t = CONFIG.thresholds.coverage;
+
+    const passed = coverage_estimate.statements >= t.statements &&
+                   coverage_estimate.branches >= t.branches &&
+                   coverage_estimate.functions >= t.functions;
+
+    return {
+      passed,
+      coverage: coverage_estimate,
+      untestable_areas: passed ? [] : untestable_areas
+    };
+  }
+
+  evaluateStyleGate(result) {
+    if (result.escalated || !result.data) {
+      return { passed: false, reason: 'Gate execution failed' };
+    }
+
+    const { quality_score, issues, complexity_analysis } = result.data;
+    const t = CONFIG.thresholds.quality;
+
+    const passed = quality_score >= t.minScore &&
+                   complexity_analysis.cyclomatic_complexity.max <= t.maxComplexity;
+
+    return {
+      passed,
+      qualityScore: quality_score,
+      issues: passed ? [] : issues.filter(i => i.severity === 'error')
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // UTILITIES
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  async callLLM(systemPrompt, userMessage) {
+    const response = await fetch(CONFIG.apiEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: CONFIG.model,
+        max_tokens: 8192,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userMessage }]
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`LLM API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.content[0].text;
+  }
+
+  hash(data) {
+    return crypto.createHash('sha256').update(data).digest('hex').slice(0, 16);
+  }
+
+  verifyChecksums(files) {
+    for (const file of files) {
+      const computed = this.hash(file.content);
+      if (file.checksum && file.checksum !== computed) {
+        console.warn(`⚠️  Checksum mismatch for ${file.path}`);
+      }
+    }
+  }
+
+  validateSchema(data, schema) {
+    // Simplified schema validation - in production use Ajv
+    const errors = [];
+    for (const [key, def] of Object.entries(schema.properties || {})) {
+      if (schema.required?.includes(key) && !(key in data)) {
+        errors.push(`Missing required field: ${key}`);
+      }
+    }
+    if (schema.additionalProperties === false) {
+      const allowed = new Set(Object.keys(schema.properties || {}));
+      for (const key of Object.keys(data)) {
+        if (!allowed.has(key)) {
+          errors.push(`Unexpected field: ${key}`);
+        }
+      }
+    }
+    return { valid: errors.length === 0, errors };
+  }
+
+  extractFeedback(role, data) {
+    switch (role) {
+      case 'ARCHITECT':
+        return { rejection_reason: data.rejection_reason, questions: data.clarifying_questions };
+      case 'SECURITY_CRITIC':
+        return { vulnerabilities: data.vulnerabilities?.slice(0, 3) };
+      case 'UNIT_TESTER':
+        return { untestable: data.untestable_areas };
+      default:
+        return { raw: data };
+    }
+  }
+
+  async appendAuditLog(entry) {
+    try {
+      await fs.mkdir('./logs', { recursive: true });
+      await fs.appendFile(CONFIG.auditLogPath, JSON.stringify(entry) + '\n');
+    } catch (e) {
+      console.warn('Audit log write failed:', e.message);
+    }
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  buildFailureResponse(stage, result) {
+    return {
+      sessionId: this.sessionId,
+      verdict: 'FAILED',
+      failedAt: stage,
+      escalated: result.escalated || false,
+      feedback: result.feedback || [],
+      auditTrail: this.auditTrail
+    };
+  }
+
+  logFinalResult(response) {
+    const icon = response.verdict === 'APPROVED' ? '✅' : 
+                 response.verdict === 'NEEDS_REVISION' ? '🔄' : '❌';
+    console.log(`\n${icon} Final Verdict: ${response.verdict}`);
+    console.log(`   Confidence: ${(response.confidence * 100).toFixed(1)}%`);
+    console.log(`   Session: ${response.sessionId}\n`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI INTERFACE
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  
+  if (args[0] === 'audit' && args[1]) {
+    // Inspect audit trail for a session
+    const logs = await fs.readFile(CONFIG.auditLogPath, 'utf-8');
+    const entries = logs.split('\n').filter(Boolean).map(JSON.parse);
+    const session = entries.filter(e => e.sessionId === args[1]);
+    console.log(JSON.stringify(session, null, 2));
+    return;
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.error('Error: ANTHROPIC_API_KEY environment variable required');
+    process.exit(1);
+  }
+
+  let requirement;
+  if (args[0] === '--from-file' && args[1]) {
+    requirement = await fs.readFile(args[1], 'utf-8');
+  } else if (args.length > 0) {
+    requirement = args.join(' ');
+  } else {
+    console.log('Usage:');
+    console.log('  node orchestrator.js "Build a REST API for todo items"');
+    console.log('  node orchestrator.js --from-file requirements.md');
+    console.log('  node orchestrator.js audit <session-id>');
+    process.exit(0);
+  }
+
+  const orchestrator = new CodingAgentOrchestrator(apiKey);
+  const result = await orchestrator.runWorkflow(requirement);
+  
+  console.log('\n─── RESULT ───');
+  console.log(JSON.stringify(result, null, 2));
+}
+
+main().catch(console.error);
+
+export { CodingAgentOrchestrator, CONFIG };
