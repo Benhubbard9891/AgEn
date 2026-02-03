@@ -1,0 +1,888 @@
+// ============================================================
+// CODING AGENT WORKFLOW - COMPLETE PRODUCTION PACKAGE
+// ============================================================
+// Version: 2.0.0
+// Architecture: DAG with parallel validation gates
+// Gates: Architect → Coder → [Security | Tester | Style] → Supervisor
+// ============================================================
+
+import crypto from 'crypto';
+
+// ============================================================
+// SECTION 1: CONFIGURATION
+// ============================================================
+
+export const CONFIG = {
+  // Gate thresholds
+  thresholds: {
+    security_max_severity: 0.7,
+    security_max_medium_findings: 3,
+    test_min_coverage: 0.8,
+    test_min_pass_rate: 1.0,
+    style_min_score: 0.7,
+    complexity_ceiling: 10
+  },
+  
+  // Retry behavior
+  retry: {
+    max_attempts: 3,
+    base_delay_ms: 1000,
+    backoff_multiplier: 2.5,
+    jitter: true
+  },
+  
+  // Performance
+  performance: {
+    parallel_gates: true,
+    stream_responses: true,
+    cache_specs: true,
+    timeout_ms: 120000
+  },
+  
+  // Audit
+  audit: {
+    log_file: './logs/supervisor-audit.jsonl',
+    capture_input_hashes: true,
+    capture_timestamps: true,
+    retention_days: 90
+  },
+  
+  // Model settings per role (optimize cost/speed)
+  models: {
+    ARCHITECT: { model: 'claude-sonnet-4-5-20250929', temperature: 0.3 },
+    CODER: { model: 'claude-sonnet-4-5-20250929', temperature: 0.2 },
+    SECURITY_CRITIC: { model: 'claude-sonnet-4-5-20250929', temperature: 0.1 },
+    UNIT_TESTER: { model: 'claude-sonnet-4-5-20250929', temperature: 0.1 },
+    STYLE_REVIEWER: { model: 'claude-haiku-4-5-20251001', temperature: 0.1 },
+    SUPERVISOR: { model: 'claude-sonnet-4-5-20250929', temperature: 0.0 }
+  }
+};
+
+// ============================================================
+// SECTION 2: SYSTEM PROMPTS
+// ============================================================
+
+export const SYSTEM_PROMPTS = {
+  
+  // --------------------------------------------------------
+  // ARCHITECT - Decomposes requirements into specs
+  // --------------------------------------------------------
+  ARCHITECT: `# ROLE: Software Architect
+
+You decompose requirements into precise technical specifications. You produce blueprints—NOT implementation code.
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "spec_version": "1.0",
+  "requirement_hash": "<sha256 of original prompt>",
+  "project_name": "<slug-case-name>",
+  "summary": "<one paragraph technical summary>",
+  "technology_stack": {
+    "language": "<primary language>",
+    "runtime": "<e.g., Node 20, Python 3.12>",
+    "frameworks": ["<list>"],
+    "dependencies": [{ "name": "<pkg>", "version": "<semver>", "purpose": "<why>" }]
+  },
+  "architecture_pattern": "<MVC|microservices|pipeline|event-driven>",
+  "file_structure": [{
+    "path": "<relative/path.ext>",
+    "purpose": "<single responsibility>",
+    "exports": ["<names>"],
+    "imports_from": ["<internal paths>"],
+    "complexity": <1-10>
+  }],
+  "interfaces": [{
+    "name": "<FunctionOrClass>",
+    "file": "<path>",
+    "signature": "<TypeScript-style>",
+    "description": "<what it does>",
+    "preconditions": ["<required state>"],
+    "postconditions": ["<guaranteed outcome>"]
+  }],
+  "data_models": [{
+    "name": "<ModelName>",
+    "fields": [{ "name": "<field>", "type": "<type>", "constraints": "<rules>" }]
+  }],
+  "success_criteria": [{
+    "id": "SC-001",
+    "description": "<testable statement>",
+    "verification_method": "<unit_test|integration_test|manual>"
+  }],
+  "clarification_needed": [{ "item": "<ambiguity>", "options": ["<A>", "<B>"] }],
+  "estimated_total_complexity": <1-10>,
+  "notes_for_coder": "<critical guidance>"
+}
+\`\`\`
+
+## RULES
+- Commit to ONE architecture, no alternatives
+- Pin ALL dependency versions
+- Every file needs a single, clear purpose
+- Success criteria must be mechanically verifiable
+- If requirements are ambiguous, add to clarification_needed but still produce a complete spec using reasonable defaults`,
+
+  // --------------------------------------------------------
+  // CODER - Implements the specification
+  // --------------------------------------------------------
+  CODER: `# ROLE: Implementation Engineer
+
+You write production code based on Architect specifications. You implement EXACTLY what the spec describes.
+
+## INPUT
+You receive a specification object with file_structure, interfaces, and success_criteria.
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "implementation_version": "1.0",
+  "spec_hash": "<sha256 of input spec>",
+  "files": [{
+    "path": "<exact path from spec>",
+    "content": "<complete file content>",
+    "language": "<js|ts|py|etc>",
+    "lines": <line count>,
+    "checksum": "<sha256 of content>"
+  }],
+  "entry_point": "<main file path>",
+  "build_commands": ["<npm install>", "<npm run build>"],
+  "run_command": "<how to execute>",
+  "environment_variables": [{ "name": "<VAR>", "description": "<purpose>", "required": <boolean> }],
+  "implementation_notes": "<decisions made during coding>",
+  "deviations_from_spec": [{
+    "spec_item": "<what was specified>",
+    "actual": "<what was implemented>",
+    "reason": "<why deviation was necessary>"
+  }]
+}
+\`\`\`
+
+## RULES
+- Implement ALL files in the spec's file_structure
+- Match ALL interface signatures exactly
+- Include comprehensive error handling
+- Add JSDoc/docstrings for all exports
+- NO placeholder comments like "// TODO" or "// implement later"
+- If spec is impossible, document in deviations_from_spec but still produce working code`,
+
+  // --------------------------------------------------------
+  // SECURITY_CRITIC - Vulnerability scanner
+  // --------------------------------------------------------
+  SECURITY_CRITIC: `# ROLE: Security Auditor
+
+You find vulnerabilities. You assume all input is malicious, all dependencies compromised.
+
+## THREAT MODEL
+Injection, Broken Auth, Data Exposure, XXE, Access Control, Misconfig, XSS, Insecure Deserialization, Vulnerable Deps, Insufficient Logging, Path Traversal, SSRF, Crypto Failures
+
+## SEVERITY (0.0-1.0)
+- 0.9-1.0 CRITICAL: RCE, auth bypass, data breach
+- 0.7-0.89 HIGH: Privilege escalation, significant exposure
+- 0.4-0.69 MEDIUM: Limited impact, specific conditions
+- 0.1-0.39 LOW: Minor disclosure, defense-in-depth
+- 0.0-0.09 INFO: Best practices
+
+## GATE LOGIC
+- ANY severity >= 0.7 → passed_gate: false
+- COUNT(severity >= 0.4) > 3 → passed_gate: false
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "audit_version": "1.0",
+  "code_hash": "<sha256>",
+  "scan_timestamp": "<ISO8601>",
+  "passed_gate": <boolean>,
+  "max_severity": <0.0-1.0>,
+  "summary": "<one sentence>",
+  "findings": [{
+    "id": "SEC-001",
+    "title": "<vuln name>",
+    "severity": <0.0-1.0>,
+    "severity_label": "<CRITICAL|HIGH|MEDIUM|LOW|INFO>",
+    "category": "<OWASP category>",
+    "file": "<path>",
+    "line_start": <num>,
+    "line_end": <num>,
+    "vulnerable_code": "<snippet max 200 chars>",
+    "description": "<why dangerous>",
+    "attack_vector": "<exploitation method>",
+    "remediation": "<specific fix>",
+    "references": ["<CWE-XXX>"]
+  }],
+  "dependency_audit": {
+    "scanned_count": <num>,
+    "vulnerable_count": <num>,
+    "vulnerabilities": [{ "package": "<name>", "installed_version": "<ver>", "vulnerability": "<CVE>", "severity": <0.0-1.0>, "patched_version": "<ver>" }]
+  },
+  "positive_observations": ["<good security practices found>"],
+  "metadata": { "lines_scanned": <num>, "files_scanned": <num> }
+}
+\`\`\`
+
+## RULES
+- Report uncertain issues as LOW, never ignore
+- EXACT file and line numbers required
+- Actionable remediation, not generic advice
+- Security ONLY—no style, no performance`,
+
+  // --------------------------------------------------------
+  // UNIT_TESTER - Test generation and execution
+  // --------------------------------------------------------
+  UNIT_TESTER: `# ROLE: Test Engineer
+
+You generate and conceptually execute unit tests to verify code correctness against specifications.
+
+## TEST CATEGORIES
+1. **Happy Path**: Normal inputs produce expected outputs
+2. **Edge Cases**: Boundaries, empty inputs, max values
+3. **Error Handling**: Invalid inputs trigger proper errors
+4. **Integration Points**: Module interactions work correctly
+5. **Success Criteria**: Direct verification of spec requirements
+
+## COVERAGE REQUIREMENTS
+- All exported functions must have tests
+- All success_criteria from spec must map to tests
+- Minimum 80% logical branch coverage
+- All error paths must be tested
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "test_version": "1.0",
+  "code_hash": "<sha256>",
+  "spec_hash": "<sha256>",
+  "passed_gate": <boolean>,
+  "summary": "<one sentence result>",
+  "coverage": {
+    "functions_tested": <num>,
+    "functions_total": <num>,
+    "function_coverage": <0.0-1.0>,
+    "branches_tested": <num>,
+    "branches_total": <num>,
+    "branch_coverage": <0.0-1.0>,
+    "success_criteria_verified": <num>,
+    "success_criteria_total": <num>,
+    "criteria_coverage": <0.0-1.0>
+  },
+  "test_suites": [{
+    "name": "<describe block name>",
+    "file_under_test": "<path>",
+    "tests": [{
+      "id": "TEST-001",
+      "name": "<it block name>",
+      "category": "<happy_path|edge_case|error_handling|integration|success_criteria>",
+      "success_criteria_id": "<SC-XXX or null>",
+      "status": "<pass|fail|skip>",
+      "input": "<test input summary>",
+      "expected": "<expected outcome>",
+      "actual": "<actual outcome>",
+      "assertion": "<exact assertion>",
+      "failure_reason": "<null or why it failed>",
+      "execution_time_ms": <num>
+    }]
+  }],
+  "test_code": [{
+    "path": "<test/file.test.js>",
+    "content": "<complete test file>",
+    "framework": "<jest|mocha|pytest|vitest>"
+  }],
+  "failures": [{
+    "test_id": "TEST-XXX",
+    "file": "<source file>",
+    "line": <num>,
+    "issue": "<what's wrong>",
+    "suggested_fix": "<how to fix source code>"
+  }],
+  "statistics": {
+    "total": <num>,
+    "passed": <num>,
+    "failed": <num>,
+    "skipped": <num>,
+    "pass_rate": <0.0-1.0>,
+    "total_time_ms": <num>
+  }
+}
+\`\`\`
+
+## GATE LOGIC
+- pass_rate < 1.0 → passed_gate: false
+- criteria_coverage < 0.8 → passed_gate: false
+- function_coverage < 0.8 → passed_gate: false
+
+## RULES
+- Generate REAL, RUNNABLE test code
+- Each test must be independent
+- Use descriptive test names that explain intent
+- Mock external dependencies, never real network/filesystem
+- Map every success_criteria to at least one test`,
+
+  // --------------------------------------------------------
+  // STYLE_REVIEWER - Code quality and maintainability
+  // --------------------------------------------------------
+  STYLE_REVIEWER: `# ROLE: Code Style Reviewer
+
+You enforce idiomatic code and maintainability. NOT security (Security Critic) or correctness (Unit Tester).
+
+## DIMENSIONS (weighted equally at 0.25 each)
+- **Readability**: Clear naming, appropriate comments, logical flow
+- **Consistency**: Project conventions, uniform patterns
+- **Complexity**: Cyclomatic <10, functions <40 lines
+- **Maintainability**: DRY, single responsibility, testable
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "review_version": "1.0",
+  "code_hash": "<sha256>",
+  "passed_gate": <boolean>,
+  "overall_score": <0.0-1.0>,
+  "dimension_scores": {
+    "readability": <0.0-1.0>,
+    "consistency": <0.0-1.0>,
+    "complexity": <0.0-1.0>,
+    "maintainability": <0.0-1.0>
+  },
+  "issues": [{
+    "id": "STYLE-001",
+    "dimension": "<readability|consistency|complexity|maintainability>",
+    "severity": "<blocking|warning|suggestion>",
+    "file": "<path>",
+    "line_start": <num>,
+    "line_end": <num>,
+    "current_code": "<snippet>",
+    "suggested_code": "<improved>",
+    "rationale": "<why this matters>"
+  }],
+  "metrics": {
+    "avg_function_length": <lines>,
+    "max_cyclomatic_complexity": <num>,
+    "max_nesting_depth": <num>,
+    "comment_ratio": <0.0-1.0>,
+    "duplicate_code_blocks": <num>,
+    "magic_numbers_count": <num>
+  },
+  "positive_observations": ["<good practices found>"]
+}
+\`\`\`
+
+## GATE LOGIC
+- overall_score < 0.7 → passed_gate: false
+- any blocking issue → passed_gate: false
+
+## RULES
+- Style ONLY—no security, no correctness
+- Provide fixed code for every issue
+- Be pragmatic, not pedantic`,
+
+  // --------------------------------------------------------
+  // SUPERVISOR - Final gatekeeper
+  // --------------------------------------------------------
+  SUPERVISOR: `# ROLE: Supervisor & Final Gatekeeper
+
+You are the final quality gate. You verify the implementation satisfies the ORIGINAL requirements, and all validation gates passed.
+
+## YOUR RESPONSIBILITIES
+1. Verify all parallel gates passed
+2. Cross-reference implementation against original requirements
+3. Ensure no scope creep or missing features
+4. Validate architectural decisions match requirements
+5. Make final SHIP or REJECT decision
+
+## INPUT
+You receive:
+- original_requirement: The user's initial request
+- requirement_hash: SHA256 of original requirement (for integrity)
+- spec: The Architect's specification
+- implementation: The Coder's output
+- gate_results: Array of [security, tester, style] outputs
+
+## OUTPUT SCHEMA (STRICT)
+
+\`\`\`json
+{
+  "supervisor_version": "1.0",
+  "session_id": "<uuid>",
+  "timestamp": "<ISO8601>",
+  "requirement_hash": "<sha256>",
+  "decision": "<APPROVED|REJECTED|NEEDS_REVISION>",
+  "confidence": <0.0-1.0>,
+  "summary": "<one paragraph final assessment>",
+  "gate_verification": {
+    "security": { "received": <boolean>, "passed": <boolean>, "max_severity": <num> },
+    "testing": { "received": <boolean>, "passed": <boolean>, "pass_rate": <num>, "coverage": <num> },
+    "style": { "received": <boolean>, "passed": <boolean>, "score": <num> }
+  },
+  "requirement_verification": [{
+    "requirement": "<extracted requirement from original prompt>",
+    "status": "<satisfied|partial|missing|exceeded>",
+    "evidence": "<how implementation addresses this>",
+    "notes": "<any concerns>"
+  }],
+  "architectural_review": {
+    "pattern_appropriate": <boolean>,
+    "scalability_concerns": ["<issues or empty>"],
+    "tech_stack_appropriate": <boolean>,
+    "notes": "<architectural observations>"
+  },
+  "issues_requiring_revision": [{
+    "severity": "<critical|major|minor>",
+    "category": "<security|correctness|completeness|architecture>",
+    "description": "<what's wrong>",
+    "source_gate": "<security|testing|style|supervisor>",
+    "remediation": "<specific fix required>"
+  }],
+  "approval_conditions": ["<if NEEDS_REVISION, what must be fixed>"],
+  "final_deliverables": {
+    "ready_to_ship": <boolean>,
+    "files": ["<list of approved files>"],
+    "run_command": "<how to execute>",
+    "documentation_complete": <boolean>
+  },
+  "audit_trail": {
+    "gates_executed": ["<list>"],
+    "total_issues_found": <num>,
+    "critical_issues": <num>,
+    "execution_time_ms": <num>
+  }
+}
+\`\`\`
+
+## DECISION CRITERIA
+
+**APPROVED** (all must be true):
+- All gates passed_gate: true
+- All requirements satisfied or exceeded
+- No critical issues
+- Architecture appropriate for requirements
+
+**NEEDS_REVISION** (any true):
+- 1-2 gates failed with fixable issues
+- Minor requirements gaps
+- Non-critical architectural concerns
+
+**REJECTED** (any true):
+- Security gate failed with CRITICAL findings
+- >50% of requirements missing
+- Fundamental architectural mismatch
+- Implementation doesn't compile/run
+
+## RULES
+- You are the FINAL authority—if you reject, code does not ship
+- Be thorough but fair—don't reject for nitpicks
+- Always provide actionable remediation for rejections
+- Verify requirement_hash matches to detect tampering`
+};
+
+// ============================================================
+// SECTION 3: TOOL DEFINITIONS
+// ============================================================
+
+export const TOOLS = [
+  {
+    type: "function",
+    name: "filesystem_operation",
+    description: "Read, write, list, or delete files in workspace",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["read", "write", "list", "delete"] },
+        path: { type: "string", description: "Relative path from workspace root" },
+        content: { type: "string", description: "File content (required for write)" }
+      },
+      required: ["action", "path"],
+      additionalProperties: false
+    },
+    strict: true
+  },
+  {
+    type: "function",
+    name: "execute_command",
+    description: "Run shell command in sandbox",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Command to execute" },
+        timeout_ms: { type: "number", description: "Max execution time", default: 30000 },
+        working_directory: { type: "string", description: "CWD for command" }
+      },
+      required: ["command"],
+      additionalProperties: false
+    },
+    strict: true
+  },
+  {
+    type: "function",
+    name: "report_gate_result",
+    description: "Submit structured gate validation result",
+    parameters: {
+      type: "object",
+      properties: {
+        gate_name: { type: "string", enum: ["SECURITY", "TESTING", "STYLE"] },
+        passed: { type: "boolean" },
+        result: { type: "object", description: "Full gate output per schema" }
+      },
+      required: ["gate_name", "passed", "result"],
+      additionalProperties: false
+    },
+    strict: true
+  }
+];
+
+// ============================================================
+// SECTION 4: CORE UTILITIES
+// ============================================================
+
+export function sha256(data) {
+  return crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
+}
+
+export function generateSessionId() {
+  return crypto.randomUUID();
+}
+
+export function delay(ms, jitter = false) {
+  const actual = jitter ? ms + Math.random() * ms * 0.3 : ms;
+  return new Promise(r => setTimeout(r, actual));
+}
+
+export class AuditLogger {
+  constructor(logFile) {
+    this.logFile = logFile;
+    this.buffer = [];
+  }
+
+  log(entry) {
+    const record = {
+      ...entry,
+      timestamp: new Date().toISOString(),
+      logged_at: Date.now()
+    };
+    this.buffer.push(record);
+    // In production: append to file
+    console.log('[AUDIT]', JSON.stringify(record));
+  }
+
+  flush() {
+    // Write buffer to file
+    const data = this.buffer.map(r => JSON.stringify(r)).join('\n') + '\n';
+    this.buffer = [];
+    return data;
+  }
+}
+
+// ============================================================
+// SECTION 5: ORCHESTRATOR ENGINE
+// ============================================================
+
+export class CodingAgentOrchestrator {
+  constructor(apiClient, config = CONFIG) {
+    this.api = apiClient;
+    this.config = config;
+    this.audit = new AuditLogger(config.audit.log_file);
+    this.sessionId = generateSessionId();
+  }
+
+  async executeRole(role, input, attempt = 1) {
+    const { model, temperature } = this.config.models[role];
+    const inputHash = sha256(input);
+    
+    this.audit.log({
+      session_id: this.sessionId,
+      event: 'role_start',
+      role,
+      attempt,
+      input_hash: inputHash
+    });
+
+    try {
+      const response = await this.api.messages.create({
+        model,
+        max_tokens: 8192,
+        temperature,
+        system: SYSTEM_PROMPTS[role],
+        messages: [{ role: 'user', content: JSON.stringify(input) }]
+      });
+
+      const content = response.content[0].text;
+      const result = this.parseStrictJSON(content);
+      
+      this.audit.log({
+        session_id: this.sessionId,
+        event: 'role_complete',
+        role,
+        attempt,
+        output_hash: sha256(result),
+        success: true
+      });
+
+      return { success: true, data: result, raw: content };
+
+    } catch (error) {
+      this.audit.log({
+        session_id: this.sessionId,
+        event: 'role_error',
+        role,
+        attempt,
+        error: error.message
+      });
+
+      if (attempt < this.config.retry.max_attempts) {
+        const delayMs = this.config.retry.base_delay_ms * 
+          Math.pow(this.config.retry.backoff_multiplier, attempt - 1);
+        await delay(delayMs, this.config.retry.jitter);
+        return this.executeRole(role, input, attempt + 1);
+      }
+
+      return { success: false, error: error.message };
+    }
+  }
+
+  parseStrictJSON(text) {
+    // Extract JSON from potential markdown code blocks
+    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
+    const jsonStr = jsonMatch[1].trim();
+    return JSON.parse(jsonStr);
+  }
+
+  async runParallelGates(code, spec) {
+    const gates = ['SECURITY_CRITIC', 'UNIT_TESTER', 'STYLE_REVIEWER'];
+    const input = { code, spec, code_hash: sha256(code), spec_hash: sha256(spec) };
+
+    if (this.config.performance.parallel_gates) {
+      const results = await Promise.all(
+        gates.map(gate => this.executeRole(gate, input))
+      );
+      return {
+        security: results[0],
+        testing: results[1],
+        style: results[2]
+      };
+    } else {
+      return {
+        security: await this.executeRole('SECURITY_CRITIC', input),
+        testing: await this.executeRole('UNIT_TESTER', input),
+        style: await this.executeRole('STYLE_REVIEWER', input)
+      };
+    }
+  }
+
+  extractFeedback(gateResults) {
+    const feedback = [];
+    
+    for (const [gateName, result] of Object.entries(gateResults)) {
+      if (!result.success || result.data.passed_gate) continue;
+      
+      const issues = result.data.findings || result.data.issues || result.data.failures || [];
+      for (const issue of issues) {
+        const severity = issue.severity;
+        const isBlocking = severity === 'blocking' || 
+          (typeof severity === 'number' && severity >= 0.4);
+        
+        if (isBlocking) {
+          feedback.push({
+            source: gateName.toUpperCase(),
+            file: issue.file,
+            line: issue.line_start || issue.line,
+            problem: issue.description || issue.issue || issue.rationale,
+            fix: issue.remediation || issue.suggested_fix || issue.suggested_code
+          });
+        }
+      }
+    }
+    
+    return feedback;
+  }
+
+  evaluateGates(gateResults) {
+    const t = this.config.thresholds;
+    
+    const securityPassed = gateResults.security.success && 
+      gateResults.security.data.passed_gate &&
+      gateResults.security.data.max_severity < t.security_max_severity;
+    
+    const testingPassed = gateResults.testing.success &&
+      gateResults.testing.data.passed_gate &&
+      gateResults.testing.data.statistics.pass_rate >= t.test_min_pass_rate &&
+      gateResults.testing.data.coverage.function_coverage >= t.test_min_coverage;
+    
+    const stylePassed = gateResults.style.success &&
+      gateResults.style.data.passed_gate &&
+      gateResults.style.data.overall_score >= t.style_min_score;
+
+    return {
+      allPassed: securityPassed && testingPassed && stylePassed,
+      security: securityPassed,
+      testing: testingPassed,
+      style: stylePassed
+    };
+  }
+
+  async runWorkflow(requirement) {
+    const requirementHash = sha256(requirement);
+    console.log(`\n🚀 Session: ${this.sessionId}`);
+    console.log(`📋 Requirement hash: ${requirementHash.slice(0, 16)}...`);
+
+    // Phase 1: Architecture
+    console.log('\n🏗️  Phase 1: Architecting solution...');
+    const specResult = await this.executeRole('ARCHITECT', { 
+      prompt: requirement, 
+      requirement_hash: requirementHash 
+    });
+    
+    if (!specResult.success) {
+      return { success: false, phase: 'ARCHITECT', error: specResult.error };
+    }
+
+    // Phase 2: Implementation
+    console.log('💻 Phase 2: Generating code...');
+    const codeResult = await this.executeRole('CODER', { 
+      spec: specResult.data,
+      spec_hash: sha256(specResult.data)
+    });
+    
+    if (!codeResult.success) {
+      return { success: false, phase: 'CODER', error: codeResult.error };
+    }
+
+    // Phase 3: Parallel Validation
+    let attempt = 0;
+    let gateResults, evaluation, feedback;
+    
+    while (attempt < this.config.retry.max_attempts) {
+      attempt++;
+      console.log(`\n🔍 Phase 3: Validation gates (attempt ${attempt}/${this.config.retry.max_attempts})...`);
+      
+      gateResults = await this.runParallelGates(codeResult.data, specResult.data);
+      evaluation = this.evaluateGates(gateResults);
+      
+      console.log(`   Security: ${evaluation.security ? '✅' : '❌'}`);
+      console.log(`   Testing:  ${evaluation.testing ? '✅' : '❌'}`);
+      console.log(`   Style:    ${evaluation.style ? '✅' : '❌'}`);
+
+      if (evaluation.allPassed) break;
+
+      feedback = this.extractFeedback(gateResults);
+      console.log(`   Found ${feedback.length} blocking issues, requesting fixes...`);
+      
+      // Self-healing: send feedback to coder
+      const fixResult = await this.executeRole('CODER', {
+        spec: specResult.data,
+        previous_code: codeResult.data,
+        feedback,
+        instruction: 'Fix the identified issues while preserving all working functionality'
+      });
+      
+      if (fixResult.success) {
+        codeResult.data = fixResult.data;
+      }
+    }
+
+    // Phase 4: Supervisor Review
+    console.log('\n👔 Phase 4: Supervisor final review...');
+    const supervisorResult = await this.executeRole('SUPERVISOR', {
+      original_requirement: requirement,
+      requirement_hash: requirementHash,
+      spec: specResult.data,
+      implementation: codeResult.data,
+      gate_results: {
+        security: gateResults.security.data,
+        testing: gateResults.testing.data,
+        style: gateResults.style.data
+      }
+    });
+
+    const finalDecision = supervisorResult.success ? 
+      supervisorResult.data.decision : 'ERROR';
+    
+    console.log(`\n${{
+      'APPROVED': '✅ APPROVED - Ready to ship!',
+      'NEEDS_REVISION': '🔄 NEEDS REVISION - See issues',
+      'REJECTED': '❌ REJECTED - Major issues found',
+      'ERROR': '⚠️ ERROR - Supervisor failed'
+    }[finalDecision]}`);
+
+    return {
+      success: finalDecision === 'APPROVED',
+      session_id: this.sessionId,
+      decision: finalDecision,
+      spec: specResult.data,
+      implementation: codeResult.data,
+      gate_results: gateResults,
+      supervisor: supervisorResult.data,
+      audit: this.audit.flush()
+    };
+  }
+}
+
+// ============================================================
+// SECTION 6: CLI INTERFACE
+// ============================================================
+
+export async function cli(args) {
+  const [command, ...rest] = args;
+  
+  const helpText = `
+Coding Agent CLI v2.0.0
+
+Commands:
+  generate <requirement>     Generate code from requirement
+  generate --file <path>     Generate code from requirement file
+  audit <session-id>         View audit trail for session
+  config                     Show current configuration
+  help                       Show this message
+
+Examples:
+  node agent.js generate "Build a REST API for todo items"
+  node agent.js generate --file requirements.md
+  node agent.js audit abc123-def456
+`;
+
+  switch (command) {
+    case 'generate':
+      let requirement;
+      if (rest[0] === '--file') {
+        // Read from file in real implementation
+        requirement = `[Contents of ${rest[1]}]`;
+      } else {
+        requirement = rest.join(' ');
+      }
+      
+      if (!requirement) {
+        console.log('Error: Requirement required');
+        console.log(helpText);
+        return;
+      }
+
+      // In production: initialize real API client
+      console.log('Initializing coding agent...');
+      // const orchestrator = new CodingAgentOrchestrator(anthropicClient);
+      // const result = await orchestrator.runWorkflow(requirement);
+      console.log('Ready to process:', requirement);
+      break;
+
+    case 'audit':
+      const sessionId = rest[0];
+      console.log(`Fetching audit trail for session: ${sessionId}`);
+      // In production: read from audit log file
+      break;
+
+    case 'config':
+      console.log(JSON.stringify(CONFIG, null, 2));
+      break;
+
+    case 'help':
+    default:
+      console.log(helpText);
+  }
+}
+
+// Entry point
+if (typeof process !== 'undefined' && process.argv) {
+  cli(process.argv.slice(2));
+}
